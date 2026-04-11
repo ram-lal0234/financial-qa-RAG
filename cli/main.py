@@ -26,7 +26,12 @@ from core.rag import RAGEngine
 from core.vectorstore import VectorStore, SearchFilters
 from core.config import settings
 
-app = typer.Typer(name="financial-qa", help="Financial Earnings Call Q&A Assistant", add_completion=False)
+app = typer.Typer(
+    name="financial-qa",
+    help="Financial Earnings Call Q&A Assistant",
+    add_completion=False,
+    no_args_is_help=True,
+)
 console = Console()
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")

@@ -131,10 +131,10 @@ class RAGEngine:
         relevant = [r for r in results if r.score <= settings.similarity_threshold]
 
         if not relevant:
+            best_score = f"{results[0].score:.3f}" if results else "N/A"
             logger.info(
                 f"No chunks above threshold "
-                f"(best: {results[0].score:.3f if results else 'N/A'}, "
-                f"threshold: {settings.similarity_threshold})"
+                f"(best: {best_score}, threshold: {settings.similarity_threshold})"
             )
             history.add_user(guard.sanitized_query)
             history.add_assistant(NO_CONTEXT_RESPONSE)
@@ -181,10 +181,10 @@ class RAGEngine:
         for i, r in enumerate(results, 1):
             m = r.metadata
             header = (
-                f"[Source {i}] {m.get('company','?')} | "
-                f"{m.get('quarter','?')} {m.get('fiscal_year','?')} | "
-                f"Section: {m.get('section','?')} | "
-                f"Date: {m.get('date','?')}"
+                f"[Source {i}] {m.get('company', '?')} | "
+                f"{m.get('quarter', '?')} {m.get('fiscal_year', '?')} | "
+                f"Section: {m.get('section', '?')} | "
+                f"Date: {m.get('date', '?')}"
             )
             blocks.append(f"{header}\n{r.text}")
 

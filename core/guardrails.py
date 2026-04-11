@@ -53,6 +53,7 @@ class GuardrailResult:
     reason: str
     sanitized_query: str        # cleaned version of original input
     rewritten_query: str        # optimized for embedding retrieval
+    preset_answer: Optional[str] = None  # if set, RAG skips retrieval and returns this
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +62,29 @@ class GuardrailResult:
 
 MAX_QUERY_LENGTH = 500          # chars
 MIN_QUERY_LENGTH = 3
+
+# Short social openers — allowed without running retrieval (see `check`)
+_GREETING_NORMALIZED = frozenset({
+    "hi",
+    "hello",
+    "hey",
+    "howdy",
+    "greetings",
+    "hiya",
+    "yo",
+    "sup",
+    "good morning",
+    "good afternoon",
+    "good evening",
+    "hi there",
+    "hello there",
+    "hey there",
+})
+
+_GREETING_REPLY = (
+    "Hello! I’m your earnings-call assistant. Ask me anything about revenue, margins, "
+    "guidance, deals, or other topics covered in the transcripts you’ve ingested."
+)
 
 # Patterns that indicate prompt injection attempts
 _INJECTION_PATTERNS = [
@@ -135,6 +159,17 @@ class Guardrails:
         Run all guardrail layers on a user query.
         Returns GuardrailResult — caller checks .allowed before proceeding.
         """
+        stripped = query.strip()
+        if _is_greeting_only(stripped):
+            return GuardrailResult(
+                allowed=True,
+                intent=IntentClass.UNCLEAR,
+                reason="",
+                sanitized_query=stripped,
+                rewritten_query=stripped,
+                preset_answer=_GREETING_REPLY,
+            )
+
         # Layer 1: Sanitize
         sanitized, sanitize_reason = self._sanitize(query)
         if sanitize_reason:
@@ -315,3 +350,15 @@ class Guardrails:
             logger.warning(f"Query rewrite failed (using original): {e}")
 
         return query
+
+
+def _normalize_greeting_text(q: str) -> str:
+    """Lowercase, strip punctuation, collapse spaces — for greeting-only detection."""
+    s = re.sub(r"[^\w\s]", "", q.lower())
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _is_greeting_only(q: str) -> bool:
+    if not q:
+        return False
+    return _normalize_greeting_text(q) in _GREETING_NORMALIZED

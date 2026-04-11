@@ -22,7 +22,11 @@ import logging
 from dataclasses import dataclass
 from typing import Optional, Any
 
+import logging
 import chromadb
+
+# Silence noisy ChromaDB telemetry errors
+logging.getLogger("chromadb.telemetry.product.posthog").setLevel(logging.CRITICAL)
 from chromadb.config import Settings as ChromaSettings
 
 from core.config import settings
