@@ -68,12 +68,7 @@ RAG_CONTEXT_TEMPLATE = """### Transcript Excerpts
 Based only on the excerpts above, answer this question:
 **{question}**"""
 
-NO_CONTEXT_RESPONSE = """I couldn't find relevant information in the loaded transcripts to answer your question.
-
-This could mean:
-- The topic isn't covered in the available transcripts
-- Try rephrasing or being more specific (e.g. mention company name or quarter)
-- Run `list` to see which transcripts are available"""
+NO_CONTEXT_RESPONSE = """I couldn't find relevant information."""
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +107,18 @@ class RAGEngine:
                 rewritten_query=question,
                 blocked=True,
                 block_reason="intent_filter",
+            )
+
+        # ── Preset answer (e.g. greetings) — skip RAG entirely ────────
+        if guard.preset_answer:
+            history.add_user(guard.sanitized_query)
+            history.add_assistant(guard.preset_answer)
+            return RAGResponse(
+                answer=guard.preset_answer,
+                sources=[],
+                used_rag=False,
+                query=question,
+                rewritten_query=question,
             )
 
         retrieval_query = guard.rewritten_query

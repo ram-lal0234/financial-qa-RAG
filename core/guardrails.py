@@ -4,22 +4,8 @@ core/guardrails.py
 Three-layer guardrail system that sits in front of the RAG engine:
 
   Layer 1 — Input Sanitization
-    Strip prompt injection attempts, excessive length, dangerous patterns
-    before anything hits the LLM.
-
-  Layer 2 — Intent Classification
-    Fast, cheap LLM call to decide if a query is finance/earnings related.
-    Blocks off-topic questions (sports, recipes, general knowledge, etc.)
-    before spending tokens on full RAG retrieval.
-
-  Layer 3 — Response Validation
-    After RAG generates an answer, check it doesn't hallucinate or go
-    off-topic. If confidence is too low, return a graceful fallback.
-
-Design note:
-  The intent classifier uses gpt-4o-mini with a very small prompt and
-  max_tokens=10 — it only needs to return "RELEVANT" or "IRRELEVANT".
-  Cost is negligible (~0.001 cents per check).
+  Layer 2 — Intent Classification (keyword pre-check + LLM classifier)
+  Layer 3 — Query Rewriting
 """
 
 from __future__ import annotations
@@ -41,9 +27,9 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class IntentClass(str, Enum):
-    RELEVANT   = "RELEVANT"    # finance / earnings related → proceed
-    IRRELEVANT = "IRRELEVANT"  # off-topic → block
-    UNCLEAR    = "UNCLEAR"     # ambiguous → allow with warning
+    RELEVANT   = "RELEVANT"
+    IRRELEVANT = "IRRELEVANT"
+    UNCLEAR    = "UNCLEAR"
 
 
 @dataclass
@@ -51,42 +37,29 @@ class GuardrailResult:
     allowed: bool
     intent: IntentClass
     reason: str
-    sanitized_query: str        # cleaned version of original input
-    rewritten_query: str        # optimized for embedding retrieval
-    preset_answer: Optional[str] = None  # if set, RAG skips retrieval and returns this
+    sanitized_query: str
+    rewritten_query: str
+    preset_answer: Optional[str] = None  # if set, RAG skips retrieval
 
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-MAX_QUERY_LENGTH = 500          # chars
+MAX_QUERY_LENGTH = 500
 MIN_QUERY_LENGTH = 3
 
-# Short social openers — allowed without running retrieval (see `check`)
 _GREETING_NORMALIZED = frozenset({
-    "hi",
-    "hello",
-    "hey",
-    "howdy",
-    "greetings",
-    "hiya",
-    "yo",
-    "sup",
-    "good morning",
-    "good afternoon",
-    "good evening",
-    "hi there",
-    "hello there",
-    "hey there",
+    "hi", "hello", "hey", "howdy", "greetings", "hiya", "yo", "sup",
+    "good morning", "good afternoon", "good evening",
+    "hi there", "hello there", "hey there",
 })
 
 _GREETING_REPLY = (
-    "Hello! I’m your earnings-call assistant. Ask me anything about revenue, margins, "
-    "guidance, deals, or other topics covered in the transcripts you’ve ingested."
+    "Hello! I'm your earnings-call assistant. Ask me anything about revenue, margins, "
+    "guidance, deals, or other topics covered in the transcripts you've ingested."
 )
 
-# Patterns that indicate prompt injection attempts
 _INJECTION_PATTERNS = [
     r"ignore\s+(all\s+)?previous\s+instructions",
     r"you\s+are\s+now\s+a",
@@ -100,7 +73,6 @@ _INJECTION_PATTERNS = [
 ]
 _INJECTION_RE = re.compile("|".join(_INJECTION_PATTERNS), re.IGNORECASE)
 
-# Finance-adjacent keywords for fast pre-check before LLM call
 _FINANCE_KEYWORDS = {
     "revenue", "earnings", "profit", "margin", "ebitda", "pat", "quarter",
     "fy", "financial", "growth", "guidance", "deal", "tcv", "order", "book",
@@ -115,7 +87,6 @@ _FINANCE_KEYWORDS = {
     "crore", "million", "billion", "basis", "point", "yoy", "qoq",
 }
 
-# Clearly off-topic keywords — fast reject without LLM call
 _OFFTOPIC_KEYWORDS = {
     "recipe", "cooking", "weather", "sports", "cricket", "football",
     "movie", "song", "lyrics", "celebrity", "actor", "politician",
@@ -123,7 +94,6 @@ _OFFTOPIC_KEYWORDS = {
     "what is the capital", "who invented", "how to cook",
 }
 
-# Intent classifier system prompt — kept very short for speed/cost
 _INTENT_SYSTEM_PROMPT = """You are a query classifier for a financial earnings call analysis system.
 Classify if the user's query is relevant to financial earnings calls, company performance, business metrics, or related topics.
 
@@ -141,25 +111,34 @@ Examples:
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _normalize_greeting_text(q: str) -> str:
+    s = re.sub(r"[^\w\s]", "", q.lower())
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _is_greeting_only(q: str) -> bool:
+    if not q:
+        return False
+    return _normalize_greeting_text(q) in _GREETING_NORMALIZED
+
+
+# ---------------------------------------------------------------------------
 # Guardrails
 # ---------------------------------------------------------------------------
 
 class Guardrails:
-    """
-    Wraps the full guardrail pipeline.
-    Used by RAGEngine before every query.
-    """
 
     def __init__(self) -> None:
         settings.validate()
         self._client = OpenAI(api_key=settings.openai_api_key)
 
     def check(self, query: str) -> GuardrailResult:
-        """
-        Run all guardrail layers on a user query.
-        Returns GuardrailResult — caller checks .allowed before proceeding.
-        """
         stripped = query.strip()
+
+        # Greeting shortcut — no RAG needed
         if _is_greeting_only(stripped):
             return GuardrailResult(
                 allowed=True,
@@ -181,7 +160,7 @@ class Guardrails:
                 rewritten_query=sanitized,
             )
 
-        # Layer 2: Fast keyword pre-check (no LLM cost)
+        # Layer 2a: Fast keyword check
         fast_result = self._fast_keyword_check(sanitized)
         if fast_result is not None:
             intent, allowed = fast_result
@@ -189,27 +168,31 @@ class Guardrails:
                 return GuardrailResult(
                     allowed=False,
                     intent=intent,
-                    reason="Your question doesn't appear to be related to financial earnings calls. "
-                           "I can only answer questions about company performance, revenue, margins, "
-                           "deals, and other earnings call topics.",
+                    reason=(
+                        "Your question doesn't appear to be related to financial earnings calls. "
+                        "I can only answer questions about company performance, revenue, margins, "
+                        "deals, and other earnings call topics."
+                    ),
                     sanitized_query=sanitized,
                     rewritten_query=sanitized,
                 )
 
-        # Layer 2b: LLM intent classifier (for ambiguous cases)
+        # Layer 2b: LLM intent classifier
         intent = self._classify_intent(sanitized)
         if intent == IntentClass.IRRELEVANT:
             return GuardrailResult(
                 allowed=False,
                 intent=intent,
-                reason="Your question doesn't appear to be related to financial earnings calls. "
-                       "I can only answer questions about company performance, revenue, margins, "
-                       "deals, and other earnings call topics.",
+                reason=(
+                    "Your question doesn't appear to be related to financial earnings calls. "
+                    "I can only answer questions about company performance, revenue, margins, "
+                    "deals, and other earnings call topics."
+                ),
                 sanitized_query=sanitized,
                 rewritten_query=sanitized,
             )
 
-        # Layer 3: Query rewriting for better retrieval
+        # Layer 3: Query rewriting
         rewritten = self._rewrite_query(sanitized)
 
         return GuardrailResult(
@@ -220,69 +203,33 @@ class Guardrails:
             rewritten_query=rewritten,
         )
 
-    # ------------------------------------------------------------------
-    # Layer 1: Input sanitization
-    # ------------------------------------------------------------------
-
     def _sanitize(self, query: str) -> tuple[str, str]:
-        """
-        Clean and validate input.
-        Returns (cleaned_query, error_message).
-        error_message is empty string if input is clean.
-        """
-        # Strip leading/trailing whitespace
         cleaned = query.strip()
-
-        # Length checks
         if len(cleaned) < MIN_QUERY_LENGTH:
             return cleaned, "Query is too short. Please ask a complete question."
-
         if len(cleaned) > MAX_QUERY_LENGTH:
-            return cleaned[:MAX_QUERY_LENGTH], \
-                f"Query was truncated to {MAX_QUERY_LENGTH} characters."
-
-        # Prompt injection detection
+            return cleaned[:MAX_QUERY_LENGTH], f"Query was truncated to {MAX_QUERY_LENGTH} characters."
         if _INJECTION_RE.search(cleaned):
             logger.warning(f"Prompt injection attempt detected: {cleaned[:100]}")
-            return cleaned, "I detected an attempt to override my instructions. " \
-                            "Please ask a genuine question about financial earnings calls."
-
-        # Strip potential HTML/script tags
+            return cleaned, (
+                "I detected an attempt to override my instructions. "
+                "Please ask a genuine question about financial earnings calls."
+            )
         cleaned = re.sub(r'<[^>]+>', '', cleaned)
-
-        # Normalize whitespace
         cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-
         return cleaned, ""
 
-    # ------------------------------------------------------------------
-    # Layer 2: Intent classification
-    # ------------------------------------------------------------------
-
     def _fast_keyword_check(self, query: str) -> Optional[tuple[IntentClass, bool]]:
-        """
-        Zero-cost keyword check before LLM call.
-        Returns (IntentClass, allowed) or None if inconclusive.
-        """
         q_lower = query.lower()
         words = set(re.findall(r'\b\w+\b', q_lower))
-
-        # Definite finance hit → skip LLM check
         if words & _FINANCE_KEYWORDS:
             return (IntentClass.RELEVANT, True)
-
-        # Definite off-topic hit → block without LLM call
         for phrase in _OFFTOPIC_KEYWORDS:
             if phrase in q_lower:
                 return (IntentClass.IRRELEVANT, False)
-
-        return None  # Inconclusive — let LLM decide
+        return None
 
     def _classify_intent(self, query: str) -> IntentClass:
-        """
-        LLM-based intent classification.
-        Uses minimal tokens — only returns one word.
-        """
         try:
             response = self._client.chat.completions.create(
                 model=settings.model,
@@ -295,34 +242,17 @@ class Guardrails:
             )
             result = response.choices[0].message.content.strip().upper()
             logger.debug(f"Intent classification: '{query[:50]}' → {result}")
-
             if "IRRELEVANT" in result:
                 return IntentClass.IRRELEVANT
             elif "UNCLEAR" in result:
                 return IntentClass.UNCLEAR
             else:
                 return IntentClass.RELEVANT
-
         except Exception as e:
-            # If classifier fails, default to ALLOW — don't block legitimate queries
             logger.warning(f"Intent classifier error (defaulting to RELEVANT): {e}")
             return IntentClass.RELEVANT
 
-    # ------------------------------------------------------------------
-    # Layer 3: Query rewriting
-    # ------------------------------------------------------------------
-
     def _rewrite_query(self, query: str) -> str:
-        """
-        Rewrite query to improve embedding retrieval quality.
-
-        Examples:
-          "what did birlasoft earn" → "Birlasoft revenue earnings Q1 FY25"
-          "how are margins"         → "EBITDA margin performance quarterly"
-          "tell me about deals"     → "TCV deal wins order book"
-
-        Uses a fast, cheap LLM call. Falls back to original if it fails.
-        """
         try:
             response = self._client.chat.completions.create(
                 model=settings.model,
@@ -342,23 +272,9 @@ class Guardrails:
                 temperature=0,
             )
             rewritten = response.choices[0].message.content.strip()
-            # Sanity check — if rewrite is wildly different length, use original
             if len(rewritten) > 3 and len(rewritten) < len(query) * 3:
                 logger.debug(f"Query rewrite: '{query[:50]}' → '{rewritten}'")
                 return rewritten
         except Exception as e:
             logger.warning(f"Query rewrite failed (using original): {e}")
-
         return query
-
-
-def _normalize_greeting_text(q: str) -> str:
-    """Lowercase, strip punctuation, collapse spaces — for greeting-only detection."""
-    s = re.sub(r"[^\w\s]", "", q.lower())
-    return re.sub(r"\s+", " ", s).strip()
-
-
-def _is_greeting_only(q: str) -> bool:
-    if not q:
-        return False
-    return _normalize_greeting_text(q) in _GREETING_NORMALIZED
