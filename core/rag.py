@@ -1,27 +1,28 @@
 """
 core/rag.py
 
-Retrieval-Augmented Generation engine.
+Retrieval-Augmented Generation engine with guardrails.
 
-Flow:
-  user query
-    → embed query
-    → retrieve top-k chunks from VectorStore (with optional filters)
-    → filter by similarity threshold
-    → build prompt with context
-    → call LLM
-    → return answer + source attribution
+Pipeline per query:
+  1. Guardrails (sanitize → intent classify → rewrite)
+  2. Embed rewritten query
+  3. Retrieve top-k chunks from VectorStore
+  4. Filter by similarity threshold
+  5. Build context prompt
+  6. LLM generation
+  7. Return answer + sources + metadata
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 from core.embedder import Embedder
 from core.vectorstore import VectorStore, SearchResult, SearchFilters
 from core.llm import LLMClient, ConversationHistory
+from core.guardrails import Guardrails
 from core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -35,44 +36,44 @@ logger = logging.getLogger(__name__)
 class RAGResponse:
     answer: str
     sources: list[SearchResult]
-    used_rag: bool          # False if no relevant chunks found
+    used_rag: bool
     query: str
+    rewritten_query: str = ""
+    blocked: bool = False
+    block_reason: str = ""
 
 
 # ---------------------------------------------------------------------------
-# Prompt templates
+# Prompts
 # ---------------------------------------------------------------------------
 
 RAG_SYSTEM_PROMPT = """You are a financial analyst assistant specializing in earnings call analysis.
 
 Answer the user's question using ONLY the context provided below from earnings call transcripts.
-Be precise, cite specific numbers and quotes where relevant.
-If the context does not contain enough information to answer, say: "I don't have sufficient information in the provided transcripts to answer this question."
-Do NOT speculate or use knowledge outside the provided context.
+Be precise and cite specific numbers, metrics, and speaker names where relevant.
+
+Rules:
+- Only use information from the provided context. Do not use external knowledge.
+- If the context doesn't contain enough information, say so explicitly.
+- Do not speculate beyond what is stated in the transcripts.
+- When citing figures, mention the company, quarter, and speaker when known.
+- Format numbers clearly (e.g. "14.7% EBITDA margin", "$160M TCV").
 """
 
-RAG_CONTEXT_TEMPLATE = """
-### Relevant Transcript Excerpts
+RAG_CONTEXT_TEMPLATE = """### Transcript Excerpts
 
 {context_blocks}
 
 ---
-Answer the following question based on the above excerpts:
-"""
+Based only on the excerpts above, answer this question:
+**{question}**"""
 
-OUT_OF_SCOPE_RESPONSE = (
-    "I can only answer questions about the earnings call transcripts that have been loaded. "
-    "Your question doesn't seem to be related to the available financial data. "
-    "Try asking about revenue, margins, guidance, deal wins, or other topics from the earnings calls."
-)
+NO_CONTEXT_RESPONSE = """I couldn't find relevant information in the loaded transcripts to answer your question.
 
-NO_CONTEXT_RESPONSE = (
-    "I couldn't find relevant information in the loaded transcripts to answer your question. "
-    "This might be because:\n"
-    "• The topic isn't covered in the available transcripts\n"
-    "• Try rephrasing your question or specifying a company/quarter\n"
-    "• Use `list` to see which transcripts are available"
-)
+This could mean:
+- The topic isn't covered in the available transcripts
+- Try rephrasing or being more specific (e.g. mention company name or quarter)
+- Run `list` to see which transcripts are available"""
 
 
 # ---------------------------------------------------------------------------
@@ -81,16 +82,15 @@ NO_CONTEXT_RESPONSE = (
 
 class RAGEngine:
     """
-    Combines retrieval and generation into a single query interface.
-
-    The engine is stateless — conversation history is managed externally
-    (in the CLI session) and passed in on each call.
+    Stateless RAG engine with guardrail integration.
+    Conversation history is managed externally and passed in per call.
     """
 
     def __init__(self) -> None:
-        self.embedder = Embedder()
-        self.store = VectorStore()
-        self.llm = LLMClient()
+        self.embedder   = Embedder()
+        self.store      = VectorStore()
+        self.llm        = LLMClient()
+        self.guardrails = Guardrails()
 
     def query(
         self,
@@ -98,49 +98,66 @@ class RAGEngine:
         history: ConversationHistory,
         filters: Optional[SearchFilters] = None,
     ) -> RAGResponse:
-        """
-        Full RAG pipeline: retrieve → build context → generate answer.
-        """
-        # 1. Embed query
-        query_embedding = self.embedder.embed_single(question)
+        """Full RAG pipeline with guardrails."""
 
-        # 2. Retrieve relevant chunks
+        # ── Step 1: Guardrails ─────────────────────────────────────────
+        guard = self.guardrails.check(question)
+        if not guard.allowed:
+            logger.info(f"Query blocked by guardrails: {guard.reason}")
+            return RAGResponse(
+                answer=guard.reason,
+                sources=[],
+                used_rag=False,
+                query=question,
+                rewritten_query=question,
+                blocked=True,
+                block_reason="intent_filter",
+            )
+
+        retrieval_query = guard.rewritten_query
+        logger.debug(f"Retrieval query: '{retrieval_query}'")
+
+        # ── Step 2: Embed ──────────────────────────────────────────────
+        query_embedding = self.embedder.embed_single(retrieval_query)
+
+        # ── Step 3: Retrieve ───────────────────────────────────────────
         results = self.store.search(
             query_embedding=query_embedding,
             filters=filters,
             top_k=settings.top_k_results,
         )
 
-        # 3. Filter by similarity threshold
-        relevant = [
-            r for r in results
-            if r.score <= settings.similarity_threshold
-        ]
+        # ── Step 4: Confidence filter ──────────────────────────────────
+        relevant = [r for r in results if r.score <= settings.similarity_threshold]
 
-        # 4. If no relevant chunks → no-context response
         if not relevant:
-            logger.info(f"No relevant chunks found (threshold={settings.similarity_threshold})")
-            history.add_user(question)
+            logger.info(
+                f"No chunks above threshold "
+                f"(best: {results[0].score:.3f if results else 'N/A'}, "
+                f"threshold: {settings.similarity_threshold})"
+            )
+            history.add_user(guard.sanitized_query)
             history.add_assistant(NO_CONTEXT_RESPONSE)
             return RAGResponse(
                 answer=NO_CONTEXT_RESPONSE,
                 sources=[],
                 used_rag=False,
                 query=question,
+                rewritten_query=retrieval_query,
             )
 
-        logger.info(f"Retrieved {len(relevant)} relevant chunks (best score: {relevant[0].score:.3f})")
+        logger.info(f"Retrieved {len(relevant)} chunks (best: {relevant[0].score:.3f})")
 
-        # 5. Build context-augmented prompt
-        context_prompt = self._build_context_prompt(question, relevant)
+        # ── Step 5: Build context prompt ───────────────────────────────
+        context_prompt = self._build_context_prompt(guard.sanitized_query, relevant)
 
-        # 6. Add to history and call LLM
+        # ── Step 6: Generate ───────────────────────────────────────────
         history.add_user(context_prompt)
         response = self.llm.chat(history, system_prompt=RAG_SYSTEM_PROMPT)
         answer = response.content
 
-        # Store clean question/answer in history (not the full context blob)
-        history.messages[-1].content = question   # replace context-padded msg
+        # Store clean question/answer in history (not the padded context)
+        history.messages[-1].content = guard.sanitized_query
         history.add_assistant(answer)
 
         return RAGResponse(
@@ -148,6 +165,7 @@ class RAGEngine:
             sources=relevant,
             used_rag=True,
             query=question,
+            rewritten_query=retrieval_query,
         )
 
     # ------------------------------------------------------------------
@@ -160,16 +178,17 @@ class RAGEngine:
         results: list[SearchResult],
     ) -> str:
         blocks = []
-        for i, result in enumerate(results, 1):
-            meta = result.metadata
+        for i, r in enumerate(results, 1):
+            m = r.metadata
             header = (
-                f"[{i}] {meta.get('company', '?')} | "
-                f"{meta.get('quarter', '?')} {meta.get('fiscal_year', '?')} | "
-                f"Section: {meta.get('section', '?')}"
+                f"[Source {i}] {m.get('company','?')} | "
+                f"{m.get('quarter','?')} {m.get('fiscal_year','?')} | "
+                f"Section: {m.get('section','?')} | "
+                f"Date: {m.get('date','?')}"
             )
-            blocks.append(f"{header}\n{result.text}")
+            blocks.append(f"{header}\n{r.text}")
 
-        context = RAG_CONTEXT_TEMPLATE.format(
-            context_blocks="\n\n---\n\n".join(blocks)
+        return RAG_CONTEXT_TEMPLATE.format(
+            context_blocks="\n\n---\n\n".join(blocks),
+            question=question,
         )
-        return context + f"\n**Question:** {question}"
