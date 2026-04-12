@@ -11,6 +11,7 @@ Supports:
 
 from __future__ import annotations
 
+import re
 import time
 import logging
 from typing import Generator, Iterator
@@ -22,6 +23,44 @@ from openai.types.chat import ChatCompletionMessageParam
 from core.config import settings
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Model compatibility helpers
+# ---------------------------------------------------------------------------
+
+# Models in these families require max_completion_tokens instead of max_tokens
+# and do not support a custom temperature (only the default of 1 is allowed).
+_NEW_MODEL_RE = re.compile(
+    r"^o\d|gpt-4\.1|gpt-4\.5|gpt-5", re.IGNORECASE
+)
+
+
+def _is_new_model(model: str) -> bool:
+    return bool(_NEW_MODEL_RE.search(model))
+
+
+def _tokens_kwarg(model: str, n: int) -> dict[str, int]:
+    """Return the correct token-limit kwarg for the given model.
+
+    Older models (gpt-4o, gpt-4o-mini, gpt-4, gpt-3.5-*) use ``max_tokens``.
+    Newer models (o1/o3/o4 reasoning series, gpt-4.1-*, gpt-4.5-*, gpt-5-*)
+    require ``max_completion_tokens``.
+    """
+    if _is_new_model(model):
+        return {"max_completion_tokens": n}
+    return {"max_tokens": n}
+
+
+def _temperature_kwarg(model: str, temperature: float) -> dict[str, float]:
+    """Return temperature kwarg only for models that support it.
+
+    Newer models (o-series, gpt-4.1+, gpt-4.5+, gpt-5+) only accept the
+    default temperature of 1 and raise an error if a different value is passed.
+    For those models we omit the parameter entirely.
+    """
+    if _is_new_model(model):
+        return {}
+    return {"temperature": temperature}
 
 
 # ---------------------------------------------------------------------------
@@ -151,8 +190,8 @@ class LLMClient:
                 response = self._client.chat.completions.create(
                     model=self.model,
                     messages=messages,
-                    max_tokens=self.max_tokens,
-                    temperature=self.temperature,
+                    **_tokens_kwarg(self.model, self.max_tokens),
+                    **_temperature_kwarg(self.model, self.temperature),
                 )
                 choice = response.choices[0]
                 return LLMResponse(
@@ -191,8 +230,8 @@ class LLMClient:
             stream = self._client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                max_tokens=self.max_tokens,
-                temperature=self.temperature,
+                **_tokens_kwarg(self.model, self.max_tokens),
+                **_temperature_kwarg(self.model, self.temperature),
                 stream=True,
             )
             for chunk in stream:

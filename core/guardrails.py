@@ -18,6 +18,7 @@ from typing import Optional
 
 from openai import OpenAI
 from core.config import settings
+from core.llm import _tokens_kwarg, _temperature_kwarg
 
 logger = logging.getLogger(__name__)
 
@@ -109,10 +110,48 @@ Examples:
 "Write me a Python function" → IRRELEVANT
 "Tell me about the company" → UNCLEAR"""
 
+_REWRITE_SYSTEM_PROMPT = """You are a search query optimizer for financial earnings call transcripts.
+
+Your job: Compress the question into a short keyword query for vector search.
+
+Rules:
+- KEEP verbatim: company names, quarter (Q1/Q2/Q3/Q4), fiscal year (FY25), metric names (revenue, EBITDA, PAT, margin, TCV)
+- KEEP financial units only if the user mentioned them (crore, million, INR, USD)
+- REMOVE filler words: "what was", "tell me", "how did", "can you", "in the"
+- Do NOT add terms the user did not mention — no guessing, no synonyms
+- Output ONLY the keywords, no sentence structure, max 12 words
+
+Examples:
+Q: "What was revenue in Q1 FY25?" → "revenue Q1 FY25"
+Q: "How did EBITDA margins change?" → "EBITDA margin change"
+Q: "Tell me about deal wins for Birlasoft Q2 FY25" → "deal wins Birlasoft Q2 FY25"
+
+Convert the question below to a keyword search query."""
+
+
+_QUARTER_RE = re.compile(r"\b(Q[1-4])\s*(?:FY\s*)?(\d{2,4})\b", re.IGNORECASE)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def extract_quarter_filter(query: str) -> tuple[str, str] | None:
+    """Return (quarter, fiscal_year) metadata filter values, or None.
+
+    Examples:
+      "revenue Q1 FY25"  → ("Q1", "FY25")
+      "margins in Q2FY24" → ("Q2", "FY24")
+      "Q3 2025 deals"    → ("Q3", "FY25")
+    """
+    m = _QUARTER_RE.search(query)
+    if not m:
+        return None
+    quarter = m.group(1).upper()
+    yr = m.group(2)
+    suffix = yr[-2:] if len(yr) == 4 else yr
+    return quarter, f"FY{suffix}"
+
 
 def _normalize_greeting_text(q: str) -> str:
     s = re.sub(r"[^\w\s]", "", q.lower())
@@ -232,13 +271,13 @@ class Guardrails:
     def _classify_intent(self, query: str) -> IntentClass:
         try:
             response = self._client.chat.completions.create(
-                model=settings.model,
+                model=settings.guardrail_model,
                 messages=[
                     {"role": "system", "content": _INTENT_SYSTEM_PROMPT},
                     {"role": "user", "content": query},
                 ],
-                max_tokens=5,
-                temperature=0,
+                **_tokens_kwarg(settings.guardrail_model, 5),
+                **_temperature_kwarg(settings.guardrail_model, 0),
             )
             result = response.choices[0].message.content.strip().upper()
             logger.debug(f"Intent classification: '{query[:50]}' → {result}")
@@ -255,21 +294,18 @@ class Guardrails:
     def _rewrite_query(self, query: str) -> str:
         try:
             response = self._client.chat.completions.create(
-                model=settings.model,
+                model=settings.guardrail_model,
                 messages=[
                     {
                         "role": "system",
                         "content": (
-                            "You are a search query optimizer for financial earnings call transcripts. "
-                            "Rewrite the user's question as a concise search query using financial terminology. "
-                            "Include relevant keywords like metric names, company names, quarter identifiers. "
-                            "Return ONLY the rewritten query, nothing else. Keep it under 20 words."
+                            _REWRITE_SYSTEM_PROMPT
                         ),
                     },
                     {"role": "user", "content": query},
                 ],
-                max_tokens=40,
-                temperature=0,
+                **_tokens_kwarg(settings.guardrail_model, 40),
+                **_temperature_kwarg(settings.guardrail_model, 0),
             )
             rewritten = response.choices[0].message.content.strip()
             if len(rewritten) > 3 and len(rewritten) < len(query) * 3:

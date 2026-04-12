@@ -22,7 +22,7 @@ from typing import Optional
 from core.embedder import Embedder
 from core.vectorstore import VectorStore, SearchResult, SearchFilters
 from core.llm import LLMClient, ConversationHistory
-from core.guardrails import Guardrails
+from core.guardrails import Guardrails, extract_quarter_filter
 from core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -123,6 +123,17 @@ class RAGEngine:
 
         retrieval_query = guard.rewritten_query
         logger.debug(f"Retrieval query: '{retrieval_query}'")
+
+        # ── Auto quarter filter ────────────────────────────────────────
+        # If the caller didn't pass explicit filters, detect a quarter in
+        # the question and lock ChromaDB to that quarter/FY so all top-k
+        # slots come from the right period instead of spreading across quarters.
+        if filters is None:
+            qf = extract_quarter_filter(question)
+            if qf:
+                quarter, fiscal_year = qf
+                filters = SearchFilters(quarter=quarter, fiscal_year=fiscal_year)
+                logger.debug(f"Auto quarter filter: {quarter} {fiscal_year}")
 
         # ── Step 2: Embed ──────────────────────────────────────────────
         query_embedding = self.embedder.embed_single(retrieval_query)

@@ -15,6 +15,7 @@ class Settings:
     # LLM
     openai_api_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
     model: str = field(default_factory=lambda: os.getenv("LLM_MODEL", "gpt-4o-mini"))
+    guardrail_model: str = field(default_factory=lambda: os.getenv("GUARDRAIL_MODEL", "gpt-4o-mini"))
     max_tokens: int = int(os.getenv("MAX_TOKENS", "2048"))
     temperature: float = float(os.getenv("TEMPERATURE", "0.2"))
 
